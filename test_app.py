@@ -1,9 +1,11 @@
+import logging
 from io import BytesIO
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
+import app_final
 from app_final import app
 
 
@@ -61,19 +63,6 @@ def test_unsupported_format(client):
     assert response.status_code == 422
 
 
-def test_animation_rejected(client):
-    buffer = BytesIO()
-    with (
-        Image.new("RGB", (10, 10), "red") as first,
-        Image.new("RGB", (10, 10), "blue") as second,
-    ):
-        first.save(buffer, format="PNG", save_all=True, append_images=[second])
-    response = client.post(
-        "/images/info", files={"file": ("animated.png", buffer.getvalue())}
-    )
-    assert response.status_code == 422
-
-
 @pytest.mark.parametrize(
     "size,bounds,want",
     [
@@ -103,45 +92,6 @@ def test_invalid_resize_bounds(client, width):
         files={"file": ("image.png", image_bytes())},
     )
     assert response.status_code == 422
-
-
-def test_resize_applies_exif_orientation(client):
-    buffer = BytesIO()
-    with Image.new("RGB", (120, 80), "red") as image:
-        exif = Image.Exif()
-        exif[274] = 6
-        image.save(buffer, format="JPEG", exif=exif)
-    response = client.post(
-        "/images/resize?width=60&height=60", files={"file": ("photo.jpg", buffer.getvalue())}
-    )
-    assert response.status_code == 200
-    with Image.open(BytesIO(response.content)) as image:
-        assert image.size == (40, 60)
-        assert image.getexif().get(274, 1) == 1
-
-
-def test_resize_cmyk_jpeg(client):
-    response = client.post(
-        "/images/resize?width=60&height=60",
-        files={"file": ("print.jpg", image_bytes("JPEG", mode="CMYK"))},
-    )
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "image/png"
-    with Image.open(BytesIO(response.content)) as image:
-        image.load()
-        assert image.format == "PNG"
-        assert image.size == (60, 40)
-        assert image.mode == "RGBA"
-
-
-def test_resize_preserves_alpha(client):
-    response = client.post(
-        "/images/resize?width=60&height=60",
-        files={"file": ("image.png", image_bytes(mode="RGBA", color=(255, 0, 0, 128)))},
-    )
-    assert response.status_code == 200
-    with Image.open(BytesIO(response.content)) as image:
-        assert image.getpixel((0, 0))[3] == 128
 
 
 @pytest.mark.parametrize("source_format", ["PNG", "JPEG", "WEBP"])
@@ -179,10 +129,102 @@ def test_unsupported_output_format(client):
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("route", ["info", "resize?width=60&height=60", "convert?format=png"])
+def test_upload_limit(client, monkeypatch, route):
+    monkeypatch.setattr(app_final, "MAX_UPLOAD_BYTES", 10)
+    response = client.post(
+        f"/images/{route}", files={"file": ("image.png", image_bytes())}
+    )
+    assert response.status_code == 413
+
+
+def test_exact_upload_limit(client, monkeypatch):
+    data = image_bytes()
+    monkeypatch.setattr(app_final, "MAX_UPLOAD_BYTES", len(data))
+    response = client.post("/images/info", files={"file": ("image.png", data)})
+    assert response.status_code == 200
+
+
+def test_pixel_limit(client, monkeypatch):
+    monkeypatch.setattr(app_final, "MAX_IMAGE_PIXELS", 100)
+    response = client.post("/images/info", files={"file": ("image.png", image_bytes())})
+    assert response.status_code == 413
+
+
+def test_animation_rejected(client):
+    buffer = BytesIO()
+    with (
+        Image.new("RGB", (10, 10), "red") as first,
+        Image.new("RGB", (10, 10), "blue") as second,
+    ):
+        first.save(buffer, format="PNG", save_all=True, append_images=[second])
+    response = client.post(
+        "/images/info", files={"file": ("animated.png", buffer.getvalue())}
+    )
+    assert response.status_code == 422
+
+
+def test_resize_applies_exif_orientation(client):
+    buffer = BytesIO()
+    with Image.new("RGB", (120, 80), "red") as image:
+        exif = Image.Exif()
+        exif[274] = 6
+        image.save(buffer, format="JPEG", exif=exif)
+    response = client.post(
+        "/images/resize?width=60&height=60", files={"file": ("photo.jpg", buffer.getvalue())}
+    )
+    assert response.status_code == 200
+    with Image.open(BytesIO(response.content)) as image:
+        assert image.size == (40, 60)
+        assert image.getexif().get(274, 1) == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+def test_invalid_environment_setting(monkeypatch, value):
+    monkeypatch.setenv("MAX_UPLOAD_MB", value)
+    with pytest.raises(ValueError):
+        app_final.positive_env("MAX_UPLOAD_MB", 10)
+
+
+def test_environment_setting(monkeypatch):
+    monkeypatch.setenv("MAX_UPLOAD_MB", "3")
+    assert app_final.positive_env("MAX_UPLOAD_MB", 10) == 3
+
+
+def test_request_logging(client, caplog):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        client.get("/health")
+    assert "GET /health status=200" in caplog.text
+
+
+def test_resize_cmyk_jpeg(client):
+    response = client.post(
+        "/images/resize?width=60&height=60",
+        files={"file": ("print.jpg", image_bytes("JPEG", mode="CMYK"))},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    with Image.open(BytesIO(response.content)) as image:
+        image.load()
+        assert image.format == "PNG"
+        assert image.size == (60, 40)
+        assert image.mode == "RGBA"
+
+
 @pytest.mark.parametrize("target", ["png", "webp"])
 def test_conversion_preserves_alpha(client, target):
     response = client.post(
         f"/images/convert?format={target}",
+        files={"file": ("image.png", image_bytes(mode="RGBA", color=(255, 0, 0, 128)))},
+    )
+    assert response.status_code == 200
+    with Image.open(BytesIO(response.content)) as image:
+        assert image.getpixel((0, 0))[3] == 128
+
+
+def test_resize_preserves_alpha(client):
+    response = client.post(
+        "/images/resize?width=60&height=60",
         files={"file": ("image.png", image_bytes(mode="RGBA", color=(255, 0, 0, 128)))},
     )
     assert response.status_code == 200
