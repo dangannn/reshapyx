@@ -19,8 +19,43 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Run tests
-        run: python -m pytest -v
+      - name: Run tests with coverage
+        run: python -m pytest -v --cov=app_final --cov-branch --cov-report=term-missing --cov-report=html
+      - name: Upload coverage report
+        if: ${{ !cancelled() && hashFiles('htmlcov/index.html') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: htmlcov/
+          if-no-files-found: error
+      - name: Check application startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_file="${RUNNER_TEMP}/reshapyx-uvicorn.log"
+          health_file="${RUNNER_TEMP}/reshapyx-health.json"
+          python -m uvicorn app_final:app --host 127.0.0.1 --port 8000 > "$log_file" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+
+          for attempt in {1..30}; do
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              cat "$log_file"
+              exit 1
+            fi
+            if curl --fail --silent --max-time 2 http://127.0.0.1:8000/health > "$health_file"; then
+              python -c 'import json, sys; assert json.load(open(sys.argv[1])) == {"status": "ok"}' "$health_file"
+              echo "Application startup and /health: OK"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Application did not become healthy in time"
+          cat "$log_file"
+          exit 1
+      - name: Audit application dependencies
+        run: python -m pip_audit --strict -r requirements.txt
       - name: Package application
         uses: actions/upload-artifact@v4
         with:
