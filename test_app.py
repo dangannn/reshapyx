@@ -142,3 +142,57 @@ def test_resize_preserves_alpha(client):
     assert response.status_code == 200
     with Image.open(BytesIO(response.content)) as image:
         assert image.getpixel((0, 0))[3] == 128
+
+
+@pytest.mark.parametrize("source_format", ["PNG", "JPEG", "WEBP"])
+@pytest.mark.parametrize("target_format", ["png", "jpeg", "webp"])
+def test_convert(client, source_format, target_format):
+    response = client.post(
+        "/images/convert",
+        params={"format": target_format},
+        files={"file": ("image", image_bytes(source_format))},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"] == f"image/{target_format}"
+    assert "attachment" in response.headers["content-disposition"]
+    with Image.open(BytesIO(response.content)) as image:
+        image.load()
+        assert image.format == target_format.upper()
+        assert image.size == (120, 80)
+
+
+def test_jpeg_flattens_transparency_on_white(client):
+    response = client.post(
+        "/images/convert?format=jpeg",
+        files={"file": ("image.png", image_bytes(mode="RGBA", color=(255, 0, 0, 0)))},
+    )
+    assert response.status_code == 200
+    with Image.open(BytesIO(response.content)) as image:
+        assert image.mode == "RGB"
+        assert image.getpixel((0, 0)) == (255, 255, 255)
+
+
+def test_unsupported_output_format(client):
+    response = client.post(
+        "/images/convert?format=gif", files={"file": ("image.png", image_bytes())}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("target", ["png", "webp"])
+def test_conversion_preserves_alpha(client, target):
+    response = client.post(
+        f"/images/convert?format={target}",
+        files={"file": ("image.png", image_bytes(mode="RGBA", color=(255, 0, 0, 128)))},
+    )
+    assert response.status_code == 200
+    with Image.open(BytesIO(response.content)) as image:
+        assert image.getpixel((0, 0))[3] == 128
+
+
+def test_openapi_describes_image_downloads(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    resize = paths["/images/resize"]["post"]["responses"]["200"]["content"]
+    assert resize["image/png"]["schema"]["format"] == "binary"
+    convert = paths["/images/convert"]["post"]["responses"]["200"]["content"]
+    assert set(convert) == {"image/png", "image/jpeg", "image/webp"}

@@ -76,3 +76,31 @@ def resize_image(
         oriented.thumbnail((width, height), Image.Resampling.LANCZOS)
         with oriented.convert("RGBA") as rgba:
             return image_response(rgba, "PNG")
+
+
+@app.post(
+    "/images/convert",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {
+                media_type: {"schema": {"type": "string", "format": "binary"}}
+                for media_type in ("image/png", "image/jpeg", "image/webp")
+            }
+        }
+    },
+)
+def convert_image(
+    file: Annotated[UploadFile, File()],
+    format: Annotated[Literal["png", "jpeg", "webp"], Query()],
+):
+    """Convert an image; transparent pixels become white in JPEG."""
+    image, _, _ = read_image(file)
+    with image, ImageOps.exif_transpose(image) as oriented:
+        if format == "jpeg":
+            with oriented.convert("RGBA") as rgba:
+                with Image.new("RGB", rgba.size, "white") as background:
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    return image_response(background, "JPEG")
+        with oriented.convert("RGBA") as rgba:
+            return image_response(rgba, format.upper())
